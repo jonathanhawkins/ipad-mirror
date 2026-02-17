@@ -75,12 +75,15 @@ final class SidecarBridge: @unchecked Sendable {
         let name = deviceName(target)
         let targetID = deviceIdentifier(target)
 
-        // Already connected?
+        // If already "connected", disconnect first — the connection may be
+        // stale (e.g. iPad went to sleep). Force a fresh connection.
         let connectedIDs = Set(connectedDevices.map { deviceIdentifier($0) })
         if connectedIDs.contains(targetID) {
-            lastConnectedDeviceID = targetID
-            startWatchdog()
-            return "Already connected to \(name)"
+            NSLog("[iPad Mirror] Device appears connected, forcing reconnect...")
+            if let staleDevice = connectedDevices.first(where: { deviceIdentifier($0) == targetID }) {
+                _ = try? await forceDisconnect(staleDevice)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
         }
 
         let result: String = try await withCheckedThrowingContinuation { continuation in
@@ -150,6 +153,25 @@ final class SidecarBridge: @unchecked Sendable {
                 }
             }
             NSLog("[iPad Mirror] Modifier keys reset")
+        }
+    }
+
+    /// Disconnect without clearing watchdog state — used internally for reconnect flows.
+    private func forceDisconnect(_ device: NSObject) async throws {
+        return try await withCheckedThrowingContinuation { continuation in
+            let sel = NSSelectorFromString("disconnectFromDevice:completion:")
+            guard manager.responds(to: sel) else {
+                continuation.resume(throwing: SidecarError.apiUnavailable)
+                return
+            }
+            let block: @convention(block) (NSError?) -> Void = { error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+            manager.perform(sel, with: device, with: block)
         }
     }
 
