@@ -100,8 +100,13 @@ struct iPadMirrorShortcuts: AppShortcutsProvider {
             phrases: [
                 "Connect \(.applicationName)",
                 "Connect to \(.applicationName)",
+                "Connect to the \(.applicationName)",
                 "Start \(.applicationName)",
+                "Start the \(.applicationName)",
                 "Turn on \(.applicationName)",
+                "Turn on the \(.applicationName)",
+                "Open \(.applicationName)",
+                "Open the \(.applicationName)",
             ],
             shortTitle: "Connect iPad",
             systemImageName: "ipad.and.arrow.forward"
@@ -112,8 +117,13 @@ struct iPadMirrorShortcuts: AppShortcutsProvider {
             phrases: [
                 "Disconnect \(.applicationName)",
                 "Disconnect from \(.applicationName)",
+                "Disconnect from the \(.applicationName)",
                 "Stop \(.applicationName)",
+                "Stop the \(.applicationName)",
                 "Turn off \(.applicationName)",
+                "Turn off the \(.applicationName)",
+                "Close \(.applicationName)",
+                "Close the \(.applicationName)",
             ],
             shortTitle: "Disconnect iPad",
             systemImageName: "ipad"
@@ -123,7 +133,9 @@ struct iPadMirrorShortcuts: AppShortcutsProvider {
             intent: ToggleIPadIntent(),
             phrases: [
                 "Toggle \(.applicationName)",
+                "Toggle the \(.applicationName)",
                 "Switch \(.applicationName)",
+                "Switch the \(.applicationName)",
             ],
             shortTitle: "Toggle iPad",
             systemImageName: "arrow.triangle.2.circlepath"
@@ -133,6 +145,7 @@ struct iPadMirrorShortcuts: AppShortcutsProvider {
             intent: IPadStatusIntent(),
             phrases: [
                 "Is \(.applicationName) connected",
+                "Is the \(.applicationName) connected",
                 "\(.applicationName) status",
             ],
             shortTitle: "iPad Status",

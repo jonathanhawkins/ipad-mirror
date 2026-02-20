@@ -2,6 +2,16 @@ import Foundation
 import ObjectiveC
 import CoreGraphics
 
+/// Represents the current state of the automatic reconnection watchdog.
+enum ReconnectionState: Equatable {
+    /// No reconnection is needed or active.
+    case idle
+    /// Actively attempting to reconnect. Includes the current attempt number.
+    case retrying(attempt: Int)
+    /// All retry attempts have been exhausted.
+    case failed
+}
+
 /// Loads the private SidecarCore framework and provides access to Sidecar display management.
 final class SidecarBridge: @unchecked Sendable {
     static let shared = SidecarBridge()
@@ -11,6 +21,32 @@ final class SidecarBridge: @unchecked Sendable {
 
     /// The identifier of the device we last connected to, for auto-reconnect.
     private var lastConnectedDeviceID: String?
+
+    /// Preserved copy of the last connected device ID, kept even after watchdog gives up.
+    /// Used by retryReconnection() to allow the user to manually restart reconnection.
+    private var lastKnownDeviceID: String?
+
+    // MARK: - Reconnection State
+
+    /// Maximum number of consecutive watchdog reconnection attempts before giving up.
+    private let maxReconnectAttempts = 5
+
+    /// Tracks consecutive reconnection failures for backoff logic.
+    private var consecutiveFailures = 0
+
+    /// Whether a reconnection attempt is currently in flight (prevents overlapping calls).
+    private var isReconnecting = false
+
+    /// Observable reconnection state for the UI to display.
+    @MainActor var reconnectionState: ReconnectionState = .idle {
+        didSet {
+            reconnectionStateCallback?(reconnectionState)
+        }
+    }
+
+    /// Callback invoked on the main actor when reconnection state changes.
+    /// Set this from the UI layer to react to state transitions.
+    @MainActor var reconnectionStateCallback: ((ReconnectionState) -> Void)?
 
     init() {
         guard let bundle = Bundle(path: "/System/Library/PrivateFrameworks/SidecarCore.framework") else {
@@ -105,6 +141,10 @@ final class SidecarBridge: @unchecked Sendable {
         }
 
         lastConnectedDeviceID = targetID
+        lastKnownDeviceID = targetID
+        consecutiveFailures = 0
+        isReconnecting = false
+        Task { @MainActor in self.reconnectionState = .idle }
         startWatchdog()
         SidecarBridge.resetModifierKeys()
         return result
@@ -186,31 +226,87 @@ final class SidecarBridge: @unchecked Sendable {
 
     // MARK: - Connection Watchdog
 
+    /// Computes the poll interval in nanoseconds using exponential backoff.
+    /// Base interval is 10s, doubling each failure, capped at 180s (3 minutes).
+    private func watchdogInterval() -> UInt64 {
+        let baseSeconds: UInt64 = 10
+        let maxSeconds: UInt64 = 180
+        let backoffSeconds = min(baseSeconds * (1 << UInt64(consecutiveFailures)), maxSeconds)
+        return backoffSeconds * 1_000_000_000
+    }
+
     /// Polls connection state and auto-reconnects if the connection drops unexpectedly.
+    /// Uses exponential backoff and gives up after `maxReconnectAttempts` consecutive failures.
     func startWatchdog() {
         stopWatchdog()
+        consecutiveFailures = 0
+        Task { @MainActor in self.reconnectionState = .idle }
+
         watchdogTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000) // check every 10s
-                guard !Task.isCancelled, let self = self else { return }
+                guard let self = self else { return }
+                let interval = self.watchdogInterval()
+                try? await Task.sleep(nanoseconds: interval)
+                guard !Task.isCancelled else { return }
 
-                if !self.isConnected, self.lastConnectedDeviceID != nil {
-                    NSLog("[iPad Mirror] Connection dropped, attempting reconnect...")
-
-                    // Wait for network to settle
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
-                    guard !Task.isCancelled else { return }
-
-                    // Re-check — might have come back on its own
-                    if !self.isConnected {
-                        do {
-                            let result = try await self.reconnect()
-                            NSLog("[iPad Mirror] \(result)")
-                            SidecarBridge.resetModifierKeys()
-                        } catch {
-                            NSLog("[iPad Mirror] Reconnect failed: \(error.localizedDescription)")
-                        }
+                // Only attempt reconnect if we were previously connected
+                guard !self.isConnected, self.lastConnectedDeviceID != nil else {
+                    // Connection is fine or user disconnected intentionally; reset failures
+                    if self.isConnected && self.consecutiveFailures > 0 {
+                        self.consecutiveFailures = 0
+                        Task { @MainActor in self.reconnectionState = .idle }
                     }
+                    continue
+                }
+
+                // Check if we have exhausted retries
+                if self.consecutiveFailures >= self.maxReconnectAttempts {
+                    NSLog("[iPad Mirror] Reconnect abandoned after \(self.maxReconnectAttempts) attempts")
+                    self.lastConnectedDeviceID = nil
+                    Task { @MainActor in self.reconnectionState = .failed }
+                    return // Stop the watchdog loop
+                }
+
+                // Prevent overlapping reconnection attempts
+                guard !self.isReconnecting else {
+                    NSLog("[iPad Mirror] Reconnect already in progress, skipping")
+                    continue
+                }
+
+                self.consecutiveFailures += 1
+                let attempt = self.consecutiveFailures
+                NSLog("[iPad Mirror] Connection dropped, attempting reconnect (attempt \(attempt)/\(self.maxReconnectAttempts))...")
+                Task { @MainActor in self.reconnectionState = .retrying(attempt: attempt) }
+
+                // Wait for network to settle
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard !Task.isCancelled else { return }
+
+                // Re-check — might have come back on its own
+                if self.isConnected {
+                    self.consecutiveFailures = 0
+                    Task { @MainActor in self.reconnectionState = .idle }
+                    continue
+                }
+
+                // Pre-flight: check if any device is visible before calling the framework
+                guard self.devices.first(where: { self.deviceIdentifier($0) == self.lastConnectedDeviceID }) != nil
+                        || self.firstAvailableDevice != nil else {
+                    NSLog("[iPad Mirror] No device visible, skipping framework call (attempt \(attempt)/\(self.maxReconnectAttempts))")
+                    continue
+                }
+
+                self.isReconnecting = true
+                do {
+                    let result = try await self.reconnect()
+                    NSLog("[iPad Mirror] \(result)")
+                    self.consecutiveFailures = 0
+                    self.isReconnecting = false
+                    Task { @MainActor in self.reconnectionState = .idle }
+                    SidecarBridge.resetModifierKeys()
+                } catch {
+                    self.isReconnecting = false
+                    NSLog("[iPad Mirror] Reconnect failed (attempt \(attempt)/\(self.maxReconnectAttempts)): \(error.localizedDescription)")
                 }
             }
         }
@@ -219,6 +315,26 @@ final class SidecarBridge: @unchecked Sendable {
     func stopWatchdog() {
         watchdogTask?.cancel()
         watchdogTask = nil
+        consecutiveFailures = 0
+        isReconnecting = false
+        Task { @MainActor in self.reconnectionState = .idle }
+    }
+
+    /// Manually retries reconnection after the watchdog has given up.
+    /// Call this from the UI when the user clicks "Retry".
+    func retryReconnection() {
+        // Restore the last connected device ID if watchdog cleared it on failure
+        if lastConnectedDeviceID == nil, let knownID = lastKnownDeviceID {
+            lastConnectedDeviceID = knownID
+        }
+        NSLog("[iPad Mirror] User-initiated reconnection retry")
+        consecutiveFailures = 0
+        isReconnecting = false
+        startWatchdog()
+        // Also attempt an immediate connect
+        Task {
+            _ = try? await self.connect()
+        }
     }
 
     private func reconnect() async throws -> String {

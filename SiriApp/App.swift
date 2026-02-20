@@ -5,6 +5,7 @@ import AppIntents
 struct iPadMirrorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var isConnected = SidecarBridge.shared.isConnected
+    @State private var reconnectionState: ReconnectionState = .idle
 
     init() {
         iPadMirrorShortcuts.updateAppShortcutParameters()
@@ -23,6 +24,32 @@ struct iPadMirrorApp: App {
                             _ = try? await SidecarBridge.shared.disconnect()
                             isConnected = SidecarBridge.shared.isConnected
                         }
+                    }
+                } else if case .retrying(let attempt) = reconnectionState {
+                    Text("Reconnecting... (attempt \(attempt)/5)")
+                        .font(.headline)
+                        .foregroundStyle(.orange)
+
+                    Text("iPad connection was lost")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("Cancel Reconnect") {
+                        SidecarBridge.shared.stopWatchdog()
+                        isConnected = SidecarBridge.shared.isConnected
+                        reconnectionState = .idle
+                    }
+                } else if case .failed = reconnectionState {
+                    Text("Reconnection Failed")
+                        .font(.headline)
+                        .foregroundStyle(.red)
+
+                    Text("Could not reach iPad after multiple attempts")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("Retry Connection") {
+                        SidecarBridge.shared.retryReconnection()
                     }
                 } else if let device = SidecarBridge.shared.firstAvailableDevice {
                     Text("\(SidecarBridge.shared.deviceName(device)) available")
@@ -61,8 +88,28 @@ struct iPadMirrorApp: App {
                 .keyboardShortcut("q")
             }
             .padding(4)
+            .task {
+                // Subscribe to reconnection state changes from the bridge
+                await MainActor.run {
+                    SidecarBridge.shared.reconnectionStateCallback = { newState in
+                        self.reconnectionState = newState
+                        self.isConnected = SidecarBridge.shared.isConnected
+                    }
+                }
+            }
         } label: {
-            Image(systemName: isConnected ? "ipad.and.arrow.forward" : "ipad")
+            Image(systemName: menuBarIcon)
+        }
+    }
+
+    private var menuBarIcon: String {
+        switch reconnectionState {
+        case .retrying:
+            return "ipad.badge.exclamationmark"
+        case .failed:
+            return "ipad.slash"
+        case .idle:
+            return isConnected ? "ipad.and.arrow.forward" : "ipad"
         }
     }
 }
