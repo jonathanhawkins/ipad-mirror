@@ -70,6 +70,30 @@ struct IPadStatusIntent: AppIntent {
     }
 }
 
+// MARK: - Toggle Broken Screen Mode Intent
+
+struct ToggleBrokenScreenModeIntent: AppIntent {
+    static var title: LocalizedStringResource = "Toggle Broken Screen Mode"
+    static var description: IntentDescription = IntentDescription(
+        "Toggles Broken Screen Mode, which narrates connection states and makes the iPad the primary display.",
+        categoryName: "Display"
+    )
+    static var openAppWhenRun: Bool = false
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let newValue = !UserDefaults.standard.bool(forKey: "brokenScreenModeEnabled")
+        UserDefaults.standard.set(newValue, forKey: "brokenScreenModeEnabled")
+        let status = newValue ? "enabled" : "disabled"
+        SpeechManager.shared.announce("Broken screen mode \(status)")
+        if newValue {
+            DisplayManager.shared.takeoverIfEnabled()
+        } else {
+            DisplayManager.shared.restoreIfNeeded()
+        }
+        return .result(dialog: "Broken Screen Mode \(status)")
+    }
+}
+
 // MARK: - Intent Donation
 
 /// Donates all intents to the system to boost Siri discoverability.
@@ -80,12 +104,14 @@ func donateIntents() {
         let disconnectIntent = DisconnectIPadIntent()
         let toggleIntent = ToggleIPadIntent()
         let statusIntent = IPadStatusIntent()
+        let brokenScreenIntent = ToggleBrokenScreenModeIntent()
 
         // Donate each intent so Siri indexes them
         _ = try? await connectIntent.donate()
         _ = try? await disconnectIntent.donate()
         _ = try? await toggleIntent.donate()
         _ = try? await statusIntent.donate()
+        _ = try? await brokenScreenIntent.donate()
 
         NSLog("[iPad Mirror] Donated all intents to Siri")
     }
@@ -150,6 +176,19 @@ struct iPadMirrorShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "iPad Status",
             systemImageName: "info.circle"
+        )
+
+        AppShortcut(
+            intent: ToggleBrokenScreenModeIntent(),
+            phrases: [
+                "Toggle broken screen mode on \(.applicationName)",
+                "Toggle broken screen mode on the \(.applicationName)",
+                "Broken screen mode \(.applicationName)",
+                "Enable broken screen mode on \(.applicationName)",
+                "Disable broken screen mode on \(.applicationName)",
+            ],
+            shortTitle: "Broken Screen",
+            systemImageName: "display.trianglebadge.exclamationmark"
         )
     }
 }

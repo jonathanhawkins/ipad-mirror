@@ -1,6 +1,7 @@
 import Foundation
 import ObjectiveC
 import CoreGraphics
+import AppKit
 
 /// Represents the current state of the automatic reconnection watchdog.
 enum ReconnectionState: Equatable {
@@ -37,6 +38,9 @@ final class SidecarBridge: @unchecked Sendable {
     /// Whether a reconnection attempt is currently in flight (prevents overlapping calls).
     private var isReconnecting = false
 
+    /// Set during macOS sleep/wake to prevent the watchdog from firing while the system is settling.
+    private var isSuspendedForSleep = false
+
     /// Observable reconnection state for the UI to display.
     @MainActor var reconnectionState: ReconnectionState = .idle {
         didSet {
@@ -58,6 +62,7 @@ final class SidecarBridge: @unchecked Sendable {
             fatalError("SidecarDisplayManager class not found")
         }
         manager = managerClass.init()
+        setupSleepWakeObservers()
     }
 
     var devices: [NSObject] {
@@ -105,6 +110,7 @@ final class SidecarBridge: @unchecked Sendable {
         }
         guard let target = target else {
             NSLog("[iPad Mirror] Connect failed: no iPad found after retries")
+            SpeechManager.shared.speak("No iPad found.")
             throw SidecarError.noDeviceAvailable
         }
 
@@ -147,6 +153,8 @@ final class SidecarBridge: @unchecked Sendable {
         Task { @MainActor in self.reconnectionState = .idle }
         startWatchdog()
         SidecarBridge.resetModifierKeys()
+        SpeechManager.shared.speak("Connected to \(name)")
+        DisplayManager.shared.takeoverIfEnabled()
         return result
     }
 
@@ -161,7 +169,7 @@ final class SidecarBridge: @unchecked Sendable {
 
         let name = deviceName(target)
 
-        return try await withCheckedThrowingContinuation { continuation in
+        let result: String = try await withCheckedThrowingContinuation { continuation in
             let sel = NSSelectorFromString("disconnectFromDevice:completion:")
             guard manager.responds(to: sel) else {
                 continuation.resume(throwing: SidecarError.apiUnavailable)
@@ -178,6 +186,10 @@ final class SidecarBridge: @unchecked Sendable {
 
             manager.perform(sel, with: target, with: block)
         }
+
+        SpeechManager.shared.speak("Disconnected.")
+        DisplayManager.shared.restoreIfNeeded()
+        return result
     }
 
     /// Send key-up events for all modifier keys to prevent stuck modifiers
@@ -224,6 +236,72 @@ final class SidecarBridge: @unchecked Sendable {
         }
     }
 
+    // MARK: - Sleep/Wake Handling
+
+    private func setupSleepWakeObservers() {
+        let ws = NSWorkspace.shared.notificationCenter
+
+        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            NSLog("[iPad Mirror] System going to sleep, cancelling watchdog")
+            SpeechManager.shared.speak("Going to sleep.")
+            self.isSuspendedForSleep = true
+            // Kill the watchdog entirely so no queued Task.sleep calls can fire on wake.
+            self.watchdogTask?.cancel()
+            self.watchdogTask = nil
+        }
+
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            NSLog("[iPad Mirror] System woke up, starting 8s cooldown")
+            self.isSuspendedForSleep = true  // Ensure set even if willSleep was missed
+            self.dismissSidecarAlerts()
+            Task {
+                // Sweep for framework-shown alerts periodically during cooldown
+                for _ in 0..<8 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    await MainActor.run { self.dismissSidecarAlerts() }
+                }
+                self.isSuspendedForSleep = false
+                NSLog("[iPad Mirror] Post-wake cooldown complete")
+                // Restart watchdog if we had an active connection before sleep
+                if self.lastConnectedDeviceID != nil {
+                    NSLog("[iPad Mirror] Restarting watchdog after wake")
+                    SpeechManager.shared.speak("Reconnecting to iPad.")
+                    self.startWatchdog()
+                }
+            }
+        }
+
+        // Catch SidecarCore error alerts that appear while suspended
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self, self.isSuspendedForSleep else { return }
+            self.dismissSidecarAlerts()
+        }
+    }
+
+    /// Find and close any SidecarCore "Unable to Connect" alert panels.
+    private func dismissSidecarAlerts() {
+        for window in NSApp.windows {
+            guard window is NSPanel, let contentView = window.contentView else { continue }
+            if Self.viewTreeContainsText(contentView, matching: "Unable to Connect") {
+                NSLog("[iPad Mirror] Auto-dismissing SidecarCore error alert")
+                window.close()
+            }
+        }
+    }
+
+    private static func viewTreeContainsText(_ view: NSView, matching text: String) -> Bool {
+        if let textField = view as? NSTextField, textField.stringValue.contains(text) {
+            return true
+        }
+        return view.subviews.contains { viewTreeContainsText($0, matching: text) }
+    }
+
     // MARK: - Connection Watchdog
 
     /// Computes the poll interval in nanoseconds using exponential backoff.
@@ -249,6 +327,11 @@ final class SidecarBridge: @unchecked Sendable {
                 try? await Task.sleep(nanoseconds: interval)
                 guard !Task.isCancelled else { return }
 
+                guard !self.isSuspendedForSleep else {
+                    NSLog("[iPad Mirror] System asleep/waking, skipping reconnect")
+                    continue
+                }
+
                 // Only attempt reconnect if we were previously connected
                 guard !self.isConnected, self.lastConnectedDeviceID != nil else {
                     // Connection is fine or user disconnected intentionally; reset failures
@@ -262,6 +345,7 @@ final class SidecarBridge: @unchecked Sendable {
                 // Check if we have exhausted retries
                 if self.consecutiveFailures >= self.maxReconnectAttempts {
                     NSLog("[iPad Mirror] Reconnect abandoned after \(self.maxReconnectAttempts) attempts")
+                    SpeechManager.shared.speak("Reconnection failed.")
                     self.lastConnectedDeviceID = nil
                     Task { @MainActor in self.reconnectionState = .failed }
                     return // Stop the watchdog loop
@@ -276,6 +360,7 @@ final class SidecarBridge: @unchecked Sendable {
                 self.consecutiveFailures += 1
                 let attempt = self.consecutiveFailures
                 NSLog("[iPad Mirror] Connection dropped, attempting reconnect (attempt \(attempt)/\(self.maxReconnectAttempts))...")
+                SpeechManager.shared.speak("Connection lost. Attempt \(attempt) of 5.")
                 Task { @MainActor in self.reconnectionState = .retrying(attempt: attempt) }
 
                 // Wait for network to settle
@@ -304,6 +389,8 @@ final class SidecarBridge: @unchecked Sendable {
                     self.isReconnecting = false
                     Task { @MainActor in self.reconnectionState = .idle }
                     SidecarBridge.resetModifierKeys()
+                    SpeechManager.shared.speak("Reconnected.")
+                    DisplayManager.shared.takeoverIfEnabled()
                 } catch {
                     self.isReconnecting = false
                     NSLog("[iPad Mirror] Reconnect failed (attempt \(attempt)/\(self.maxReconnectAttempts)): \(error.localizedDescription)")
@@ -338,6 +425,10 @@ final class SidecarBridge: @unchecked Sendable {
     }
 
     private func reconnect() async throws -> String {
+        guard !isSuspendedForSleep else {
+            NSLog("[iPad Mirror] reconnect() blocked — system asleep/waking")
+            throw SidecarError.noDeviceAvailable
+        }
         guard let targetID = lastConnectedDeviceID else {
             throw SidecarError.noDeviceAvailable
         }

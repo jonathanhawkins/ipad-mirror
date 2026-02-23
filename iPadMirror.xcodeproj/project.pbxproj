@@ -16,6 +16,8 @@
 		A10007 /* ShortcutInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10009; };
 		A10008 /* SetupManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10011; };
 		A10009 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10012; };
+		A10010 /* SpeechManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10013; };
+		A10011 /* DisplayManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10014; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -30,6 +32,8 @@
 		B10009 /* ShortcutInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutInstaller.swift; sourceTree = "<group>"; };
 		B10011 /* SetupManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetupManager.swift; sourceTree = "<group>"; };
 		B10012 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		B10013 /* SpeechManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechManager.swift; sourceTree = "<group>"; };
+		B10014 /* DisplayManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayManager.swift; sourceTree = "<group>"; };
 		B10010 /* iPad Mirror.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "iPad Mirror.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -53,6 +57,8 @@
 				B10009 /* ShortcutInstaller.swift */,
 				B10011 /* SetupManager.swift */,
 				B10012 /* OnboardingView.swift */,
+				B10013 /* SpeechManager.swift */,
+				B10014 /* DisplayManager.swift */,
 				B10004 /* Info.plist */,
 				B10005 /* Entitlements.plist */,
 				B10006 /* AppIcon.icns */,
@@ -129,6 +135,8 @@
 				A10007 /* ShortcutInstaller.swift in Sources */,
 				A10008 /* SetupManager.swift in Sources */,
 				A10009 /* OnboardingView.swift in Sources */,
+				A10010 /* SpeechManager.swift in Sources */,
+				A10011 /* DisplayManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

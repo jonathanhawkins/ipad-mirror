@@ -6,6 +6,7 @@ struct iPadMirrorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var isConnected = SidecarBridge.shared.isConnected
     @State private var reconnectionState: ReconnectionState = .idle
+    @State private var brokenScreenMode = UserDefaults.standard.bool(forKey: "brokenScreenModeEnabled")
 
     init() {
         iPadMirrorShortcuts.updateAppShortcutParameters()
@@ -77,6 +78,19 @@ struct iPadMirrorApp: App {
                 Button("Reset Keyboard") {
                     SidecarBridge.resetModifierKeys()
                 }
+
+                Toggle("Broken Screen Mode", isOn: $brokenScreenMode)
+                    .onChange(of: brokenScreenMode) { _, newValue in
+                        UserDefaults.standard.set(newValue, forKey: "brokenScreenModeEnabled")
+                        SpeechManager.shared.announce(
+                            newValue ? "Broken screen mode enabled" : "Broken screen mode disabled"
+                        )
+                        if newValue {
+                            DisplayManager.shared.takeoverIfEnabled()
+                        } else {
+                            DisplayManager.shared.restoreIfNeeded()
+                        }
+                    }
 
                 Button("Setup...") {
                     appDelegate.showOnboarding()
@@ -158,6 +172,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     _ = try? await SidecarBridge.shared.disconnect()
                 case "toggle":
                     _ = try? await SidecarBridge.shared.toggle()
+                case "broken-screen":
+                    let newValue = !UserDefaults.standard.bool(forKey: "brokenScreenModeEnabled")
+                    UserDefaults.standard.set(newValue, forKey: "brokenScreenModeEnabled")
+                    SpeechManager.shared.announce(
+                        newValue ? "Broken screen mode enabled" : "Broken screen mode disabled"
+                    )
+                    if newValue {
+                        DisplayManager.shared.takeoverIfEnabled()
+                    } else {
+                        DisplayManager.shared.restoreIfNeeded()
+                    }
                 default:
                     NSLog("[iPad Mirror] Unknown URL command: \(command)")
                 }
