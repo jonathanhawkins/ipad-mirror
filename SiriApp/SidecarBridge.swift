@@ -273,14 +273,13 @@ final class SidecarBridge: @unchecked Sendable {
             }
         }
 
-        // Catch SidecarCore error alerts that appear while suspended
+        // Catch SidecarCore error alerts whenever they appear (reconnect or sleep/wake)
         NotificationCenter.default.addObserver(
             forName: NSWindow.didBecomeKeyNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self = self, self.isSuspendedForSleep else { return }
-            self.dismissSidecarAlerts()
+            self?.dismissSidecarAlerts()
         }
     }
 
@@ -394,6 +393,8 @@ final class SidecarBridge: @unchecked Sendable {
                 } catch {
                     self.isReconnecting = false
                     NSLog("[iPad Mirror] Reconnect failed (attempt \(attempt)/\(self.maxReconnectAttempts)): \(error.localizedDescription)")
+                    // Dismiss any SidecarCore error alerts spawned by the failed attempt
+                    await MainActor.run { self.dismissSidecarAlerts() }
                 }
             }
         }
