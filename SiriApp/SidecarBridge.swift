@@ -41,6 +41,9 @@ final class SidecarBridge: @unchecked Sendable {
     /// Set during macOS sleep/wake to prevent the watchdog from firing while the system is settling.
     private var isSuspendedForSleep = false
 
+    /// Timestamp of last alert dismissal, used to throttle log output.
+    private var lastAlertDismissTime: Date = .distantPast
+
     /// Observable reconnection state for the UI to display.
     @MainActor var reconnectionState: ReconnectionState = .idle {
         didSet {
@@ -273,22 +276,44 @@ final class SidecarBridge: @unchecked Sendable {
             }
         }
 
-        // Catch SidecarCore error alerts whenever they appear (reconnect or sleep/wake)
+        // Catch SidecarCore error alerts whenever a panel becomes key
         NotificationCenter.default.addObserver(
             forName: NSWindow.didBecomeKeyNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            // Only scan when an NSPanel becomes key — regular windows can't be SidecarCore alerts
+            guard notification.object is NSPanel else { return }
             self?.dismissSidecarAlerts()
         }
     }
 
-    /// Find and close any SidecarCore "Unable to Connect" alert panels.
+    /// Strings that identify SidecarCore error alert panels.
+    private static let sidecarAlertPatterns = [
+        "Unable to Connect",
+        "Cannot Connect",
+        "Connection Failed",
+        "Wi-Fi",
+        "Wi\u{2011}Fi",   // non-breaking hyphen variant Apple uses
+        "WiFi",
+        "Same Network",
+        "same network",
+    ]
+
+    /// Find and close any SidecarCore error alert panels.
     private func dismissSidecarAlerts() {
         for window in NSApp.windows {
             guard window is NSPanel, let contentView = window.contentView else { continue }
-            if Self.viewTreeContainsText(contentView, matching: "Unable to Connect") {
-                NSLog("[iPad Mirror] Auto-dismissing SidecarCore error alert")
+            let matches = Self.sidecarAlertPatterns.contains {
+                Self.viewTreeContainsText(contentView, matching: $0)
+            }
+            if matches {
+                // Throttle logging to once per 30 seconds to avoid console spam
+                let now = Date()
+                if now.timeIntervalSince(lastAlertDismissTime) > 30 {
+                    NSLog("[iPad Mirror] Auto-dismissing SidecarCore error alert")
+                }
+                lastAlertDismissTime = now
                 window.close()
             }
         }
@@ -393,7 +418,10 @@ final class SidecarBridge: @unchecked Sendable {
                 } catch {
                     self.isReconnecting = false
                     NSLog("[iPad Mirror] Reconnect failed (attempt \(attempt)/\(self.maxReconnectAttempts)): \(error.localizedDescription)")
-                    // Dismiss any SidecarCore error alerts spawned by the failed attempt
+                    // Dismiss any SidecarCore error alerts spawned by the failed attempt,
+                    // then wait briefly — the framework may take a moment to show the alert.
+                    await MainActor.run { self.dismissSidecarAlerts() }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
                     await MainActor.run { self.dismissSidecarAlerts() }
                 }
             }
