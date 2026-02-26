@@ -298,6 +298,16 @@ final class SidecarBridge: @unchecked Sendable {
         "WiFi",
         "Same Network",
         "same network",
+        "mirroring",
+        "AirPlay",
+    ]
+
+    /// Error substrings that indicate a non-transient conflict (another session is active).
+    /// The watchdog should stop retrying when it hits one of these.
+    private static let nonTransientErrorPatterns = [
+        "mirroring",
+        "AirPlay",
+        "disconnect other",
     ]
 
     /// Find and close any SidecarCore error alert panels.
@@ -417,12 +427,25 @@ final class SidecarBridge: @unchecked Sendable {
                     DisplayManager.shared.takeoverIfEnabled()
                 } catch {
                     self.isReconnecting = false
-                    NSLog("[iPad Mirror] Reconnect failed (attempt \(attempt)/\(self.maxReconnectAttempts)): \(error.localizedDescription)")
+                    let desc = error.localizedDescription
+                    NSLog("[iPad Mirror] Reconnect failed (attempt \(attempt)/\(self.maxReconnectAttempts)): \(desc)")
+
                     // Dismiss any SidecarCore error alerts spawned by the failed attempt,
                     // then wait briefly — the framework may take a moment to show the alert.
                     await MainActor.run { self.dismissSidecarAlerts() }
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                     await MainActor.run { self.dismissSidecarAlerts() }
+
+                    // If the error is a non-transient conflict (e.g. another AirPlay/mirroring
+                    // session is active), stop retrying — it won't resolve on its own.
+                    let isConflict = Self.nonTransientErrorPatterns.contains { desc.localizedCaseInsensitiveContains($0) }
+                    if isConflict {
+                        NSLog("[iPad Mirror] Non-transient conflict detected, stopping watchdog: \(desc)")
+                        SpeechManager.shared.speak("Another mirroring session is active. Disconnect it first.")
+                        self.lastConnectedDeviceID = nil
+                        Task { @MainActor in self.reconnectionState = .failed }
+                        return
+                    }
                 }
             }
         }
