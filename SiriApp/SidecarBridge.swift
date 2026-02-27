@@ -44,6 +44,10 @@ final class SidecarBridge: @unchecked Sendable {
     /// Timestamp of last alert dismissal, used to throttle log output.
     private var lastAlertDismissTime: Date = .distantPast
 
+    /// Periodic timer that sweeps for and dismisses SidecarCore alert panels.
+    /// This is the primary defense — notification-based observers are a fast-path supplement.
+    private var alertSweepTimer: Timer?
+
     /// Observable reconnection state for the UI to display.
     @MainActor var reconnectionState: ReconnectionState = .idle {
         didSet {
@@ -66,6 +70,7 @@ final class SidecarBridge: @unchecked Sendable {
         }
         manager = managerClass.init()
         setupSleepWakeObservers()
+        startAlertSweepTimer()
     }
 
     var devices: [NSObject] {
@@ -276,13 +281,23 @@ final class SidecarBridge: @unchecked Sendable {
             }
         }
 
-        // Catch SidecarCore error alerts whenever a panel becomes key
+        // Catch SidecarCore error alerts whenever a panel becomes key (fast path).
         NotificationCenter.default.addObserver(
             forName: NSWindow.didBecomeKeyNotification,
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            // Only scan when an NSPanel becomes key — regular windows can't be SidecarCore alerts
+            guard notification.object is NSPanel else { return }
+            self?.dismissSidecarAlerts()
+        }
+
+        // Also catch panels that appear without becoming key (e.g. stacked behind another).
+        // didUpdateNotification fires on any window property change including visibility.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didUpdateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
             guard notification.object is NSPanel else { return }
             self?.dismissSidecarAlerts()
         }
@@ -293,6 +308,7 @@ final class SidecarBridge: @unchecked Sendable {
         "Unable to Connect",
         "Cannot Connect",
         "Connection Failed",
+        "timed out",
         "Wi-Fi",
         "Wi\u{2011}Fi",   // non-breaking hyphen variant Apple uses
         "WiFi",
@@ -310,7 +326,22 @@ final class SidecarBridge: @unchecked Sendable {
         "disconnect other",
     ]
 
+    /// Start a repeating timer that sweeps for SidecarCore alert panels every 0.5s.
+    /// This is the primary defense against stacked alerts. The notification-based observer
+    /// in `setupSleepWakeObservers` provides a faster response for the common case, but
+    /// alerts can slip through if they don't become key, appear while the app is inactive,
+    /// or are delayed by the framework. The timer catches everything.
+    private func startAlertSweepTimer() {
+        alertSweepTimer?.invalidate()
+        alertSweepTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.dismissSidecarAlerts()
+        }
+        // Allow the timer to fire even during modal sessions and event tracking
+        RunLoop.main.add(alertSweepTimer!, forMode: .common)
+    }
+
     /// Find and close any SidecarCore error alert panels.
+    /// Uses aggressive dismissal: ends any modal session, orders the window out, then closes it.
     private func dismissSidecarAlerts() {
         for window in NSApp.windows {
             guard window is NSPanel, let contentView = window.contentView else { continue }
@@ -322,15 +353,25 @@ final class SidecarBridge: @unchecked Sendable {
                 let now = Date()
                 if now.timeIntervalSince(lastAlertDismissTime) > 30 {
                     NSLog("[iPad Mirror] Auto-dismissing SidecarCore error alert")
+                    lastAlertDismissTime = now
                 }
-                lastAlertDismissTime = now
+
+                // End any modal session the alert may have started — without this,
+                // close() on a modal panel can hang or be ignored.
+                if NSApp.modalWindow == window {
+                    NSApp.abortModal()
+                }
+
+                // orderOut immediately removes from screen; close() releases it.
+                window.orderOut(nil)
                 window.close()
             }
         }
     }
 
     private static func viewTreeContainsText(_ view: NSView, matching text: String) -> Bool {
-        if let textField = view as? NSTextField, textField.stringValue.contains(text) {
+        if let textField = view as? NSTextField,
+           textField.stringValue.localizedCaseInsensitiveContains(text) {
             return true
         }
         return view.subviews.contains { viewTreeContainsText($0, matching: text) }
