@@ -2,6 +2,39 @@ import Foundation
 import ObjectiveC
 import CoreGraphics
 import AppKit
+import os.log
+
+private let ipmLog = OSLog(subsystem: "com.user.ipad-mirror", category: "SidecarBridge")
+
+// MARK: - ObjC Runtime Introspection Helpers
+
+/// Dumps all properties and their values for an NSObject to the console log.
+/// Used to discover available SidecarCore device properties at runtime.
+private func dumpObjectProperties(_ obj: NSObject, label: String) {
+    var count: UInt32 = 0
+    guard let properties = class_copyPropertyList(type(of: obj), &count) else {
+        os_log("[iPad Mirror] %{public}s: no properties found", log: ipmLog, type: .default, label)
+        return
+    }
+    defer { free(properties) }
+
+    os_log("[iPad Mirror] %{public}s [%{public}s] — %d properties:", log: ipmLog, type: .default, label, String(describing: type(of: obj)), count)
+    for i in 0..<Int(count) {
+        let name = String(cString: property_getName(properties[i]))
+        let value = "\(obj.value(forKey: name) as Any)"
+        os_log("[iPad Mirror]   .%{public}s = %{public}s", log: ipmLog, type: .default, name, value)
+    }
+}
+
+/// Dumps all instance methods of an NSObject's class to the console log.
+private func dumpObjectMethods(_ obj: NSObject, label: String) {
+    var count: UInt32 = 0
+    guard let methods = class_copyMethodList(type(of: obj), &count) else { return }
+    defer { free(methods) }
+
+    let methodNames = (0..<Int(count)).map { String(cString: sel_getName(method_getName(methods[$0]))) }
+    os_log("[iPad Mirror] %{public}s methods (%d): %{public}s", log: ipmLog, type: .default, label, count, methodNames.joined(separator: ", "))
+}
 
 /// Represents the current state of the automatic reconnection watchdog.
 enum ReconnectionState: Equatable {
@@ -59,6 +92,9 @@ final class SidecarBridge: @unchecked Sendable {
     /// Set this from the UI layer to react to state transitions.
     @MainActor var reconnectionStateCallback: ((ReconnectionState) -> Void)?
 
+    /// Whether the method-swizzle interceptor has been installed.
+    private static var alertInterceptorInstalled = false
+
     init() {
         guard let bundle = Bundle(path: "/System/Library/PrivateFrameworks/SidecarCore.framework") else {
             fatalError("SidecarCore.framework not found")
@@ -69,16 +105,100 @@ final class SidecarBridge: @unchecked Sendable {
             fatalError("SidecarDisplayManager class not found")
         }
         manager = managerClass.init()
+        installAlertInterceptor()
         setupSleepWakeObservers()
         startAlertSweepTimer()
     }
 
+    /// Swizzle NSWindow ordering methods to intercept SidecarCore alert panels
+    /// the instant they try to appear, before they are ever rendered on screen.
+    private func installAlertInterceptor() {
+        guard !Self.alertInterceptorInstalled else { return }
+        Self.alertInterceptorInstalled = true
+
+        let pairs: [(Selector, Selector)] = [
+            (#selector(NSWindow.orderFront(_:)), #selector(NSWindow.ipm_orderFront(_:))),
+            (#selector(NSWindow.makeKeyAndOrderFront(_:)), #selector(NSWindow.ipm_makeKeyAndOrderFront(_:))),
+        ]
+
+        for (original, swizzled) in pairs {
+            guard let origMethod = class_getInstanceMethod(NSWindow.self, original),
+                  let swizMethod = class_getInstanceMethod(NSWindow.self, swizzled) else { continue }
+            method_exchangeImplementations(origMethod, swizMethod)
+        }
+        NSLog("[iPad Mirror] Alert interceptor installed")
+    }
+
+    /// Whether we have already dumped device/manager properties (one-shot diagnostics).
+    private var hasDumpedIntrospection = false
+
+    /// All Sidecar-capable devices reported by the framework (unfiltered).
+    var allDevices: [NSObject] {
+        let devs = (manager.value(forKey: "devices") as? [NSObject]) ?? []
+
+        // One-shot introspection dump — logs every property on the manager and
+        // each device so we can discover USB/transport fields at runtime.
+        if !hasDumpedIntrospection && !devs.isEmpty {
+            hasDumpedIntrospection = true
+            dumpObjectProperties(manager, label: "SidecarDisplayManager")
+            dumpObjectMethods(manager, label: "SidecarDisplayManager")
+            for (i, dev) in devs.enumerated() {
+                dumpObjectProperties(dev, label: "Device[\(i)] \(deviceName(dev))")
+            }
+        }
+
+        return devs
+    }
+
+    /// Devices filtered to only include iPads, excluding Apple Vision Pro and other non-iPad devices.
+    /// Sorted to prefer USB-connected devices over Wi-Fi (see `deviceSortKey`).
     var devices: [NSObject] {
-        (manager.value(forKey: "devices") as? [NSObject]) ?? []
+        allDevices.filter { isIPad($0) }.sorted { deviceSortKey($0) < deviceSortKey($1) }
+    }
+
+    /// Returns a sort key where lower = preferred. USB/wired devices sort first.
+    /// We probe several common SidecarCore property names that may indicate transport.
+    private func deviceSortKey(_ device: NSObject) -> Int {
+        // Check known property names that SidecarCore may expose for transport type
+        if isUSBConnected(device) {
+            return 0  // USB — preferred
+        }
+        return 1  // Wi-Fi — fallback
+    }
+
+    /// Safely read a KVC key, returning nil instead of throwing NSUnknownKeyException.
+    private func safeValue(forKey key: String, on obj: NSObject) -> Any? {
+        guard obj.responds(to: NSSelectorFromString(key)) else { return nil }
+        return obj.value(forKey: key)
+    }
+
+    /// Heuristic: returns true if the device appears to be connected via USB/wired.
+    /// Probes multiple property names since SidecarCore is a private framework.
+    func isUSBConnected(_ device: NSObject) -> Bool {
+        // "isWired" / "wired" — boolean flag
+        if let wired = safeValue(forKey: "isWired", on: device) as? Bool, wired { return true }
+        if let wired = safeValue(forKey: "wired", on: device) as? Bool, wired { return true }
+
+        // "transportType" — integer (0 = USB, 1 = Wi-Fi typically) or string
+        if let transport = safeValue(forKey: "transportType", on: device) as? Int, transport == 0 { return true }
+        if let transport = safeValue(forKey: "transportType", on: device) as? String,
+           transport.localizedCaseInsensitiveContains("usb") || transport.localizedCaseInsensitiveContains("wired") {
+            return true
+        }
+
+        // "connectionType" — similar
+        if let connType = safeValue(forKey: "connectionType", on: device) as? Int, connType == 0 { return true }
+        if let connType = safeValue(forKey: "connectionType", on: device) as? String,
+           connType.localizedCaseInsensitiveContains("usb") || connType.localizedCaseInsensitiveContains("wired") {
+            return true
+        }
+
+        return false
     }
 
     var connectedDevices: [NSObject] {
-        (manager.value(forKey: "connectedDevices") as? [NSObject]) ?? []
+        let all = (manager.value(forKey: "connectedDevices") as? [NSObject]) ?? []
+        return all.filter { isIPad($0) }
     }
 
     var isConnected: Bool {
@@ -94,6 +214,43 @@ final class SidecarBridge: @unchecked Sendable {
             return "\(val)"
         }
         return ""
+    }
+
+    /// Device identifiers we have already logged as filtered out, to avoid log spam.
+    private var loggedFilteredDeviceIDs: Set<String> = []
+
+    /// Returns `true` if the device appears to be an iPad (not an Apple Vision Pro or other non-iPad device).
+    /// Checks the device name for known non-iPad identifiers and, when available, the model property.
+    private func isIPad(_ device: NSObject) -> Bool {
+        let name = deviceName(device)
+
+        // Exclude Apple Vision Pro devices
+        let excludedNamePatterns = ["Vision Pro", "Apple Vision"]
+        for pattern in excludedNamePatterns {
+            if name.localizedCaseInsensitiveContains(pattern) {
+                let id = deviceIdentifier(device)
+                if !loggedFilteredDeviceIDs.contains(id) {
+                    loggedFilteredDeviceIDs.insert(id)
+                    NSLog("[iPad Mirror] Filtering out non-iPad device: \(name)")
+                }
+                return false
+            }
+        }
+
+        // If the framework exposes a model string, use it as an additional check.
+        // Known model prefixes: "iPad" for iPads, "RealityDevice" for Vision Pro.
+        if let model = device.value(forKey: "model") as? String {
+            if model.localizedCaseInsensitiveContains("reality") || model.localizedCaseInsensitiveContains("vision") {
+                let id = deviceIdentifier(device)
+                if !loggedFilteredDeviceIDs.contains(id) {
+                    loggedFilteredDeviceIDs.insert(id)
+                    NSLog("[iPad Mirror] Filtering out non-iPad device by model: \(name) (\(model))")
+                }
+                return false
+            }
+        }
+
+        return true
     }
 
     var connectedDeviceName: String? {
@@ -116,10 +273,27 @@ final class SidecarBridge: @unchecked Sendable {
                 if target != nil { break }
             }
         }
-        guard let target = target else {
+        guard var target = target else {
             NSLog("[iPad Mirror] Connect failed: no iPad found after retries")
             SpeechManager.shared.speak("No iPad found.")
             throw SidecarError.noDeviceAvailable
+        }
+
+        // Prefer USB over Wi-Fi: if the selected device is Wi-Fi and a USB
+        // variant exists for the same iPad, switch to the USB one.
+        if device == nil {
+            let usbDevice = devices.first { isUSBConnected($0) }
+            if let usb = usbDevice {
+                let usbName = deviceName(usb)
+                if !isUSBConnected(target) {
+                    NSLog("[iPad Mirror] Preferring USB connection to \(usbName) over Wi-Fi")
+                    target = usb
+                } else {
+                    NSLog("[iPad Mirror] Already using USB connection to \(usbName)")
+                }
+            } else {
+                NSLog("[iPad Mirror] No USB device found, using Wi-Fi")
+            }
         }
 
         let name = deviceName(target)
@@ -316,6 +490,8 @@ final class SidecarBridge: @unchecked Sendable {
         "same network",
         "mirroring",
         "AirPlay",
+        "miscellaneous error",
+        "-1010",
     ]
 
     /// Error substrings that indicate a non-transient conflict (another session is active).
@@ -326,14 +502,13 @@ final class SidecarBridge: @unchecked Sendable {
         "disconnect other",
     ]
 
-    /// Start a repeating timer that sweeps for SidecarCore alert panels every 0.5s.
-    /// This is the primary defense against stacked alerts. The notification-based observer
-    /// in `setupSleepWakeObservers` provides a faster response for the common case, but
-    /// alerts can slip through if they don't become key, appear while the app is inactive,
-    /// or are delayed by the framework. The timer catches everything.
+    /// Start a repeating timer that sweeps for SidecarCore alert panels every 0.25s.
+    /// This is a backup defense — the method-swizzle interceptor is the primary defense.
+    /// The timer catches any alerts that slip through the interceptor (e.g. if the content
+    /// view text wasn't set at the time orderFront: was called).
     private func startAlertSweepTimer() {
         alertSweepTimer?.invalidate()
-        alertSweepTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        alertSweepTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.dismissSidecarAlerts()
         }
         // Allow the timer to fire even during modal sessions and event tracking
@@ -344,29 +519,32 @@ final class SidecarBridge: @unchecked Sendable {
     /// Uses aggressive dismissal: ends any modal session, orders the window out, then closes it.
     private func dismissSidecarAlerts() {
         for window in NSApp.windows {
-            guard window is NSPanel, let contentView = window.contentView else { continue }
-            let matches = Self.sidecarAlertPatterns.contains {
-                Self.viewTreeContainsText(contentView, matching: $0)
-            }
-            if matches {
-                // Throttle logging to once per 30 seconds to avoid console spam
-                let now = Date()
-                if now.timeIntervalSince(lastAlertDismissTime) > 30 {
-                    NSLog("[iPad Mirror] Auto-dismissing SidecarCore error alert")
-                    lastAlertDismissTime = now
-                }
+            guard Self.isSidecarAlertPanel(window) else { continue }
 
-                // End any modal session the alert may have started — without this,
-                // close() on a modal panel can hang or be ignored.
-                if NSApp.modalWindow == window {
-                    NSApp.abortModal()
-                }
-
-                // orderOut immediately removes from screen; close() releases it.
-                window.orderOut(nil)
-                window.close()
+            // Throttle logging to once per 30 seconds to avoid console spam
+            let now = Date()
+            if now.timeIntervalSince(lastAlertDismissTime) > 30 {
+                NSLog("[iPad Mirror] Auto-dismissing SidecarCore error alert")
+                lastAlertDismissTime = now
             }
+
+            // End any modal session the alert may have started — without this,
+            // close() on a modal panel can hang or be ignored.
+            if NSApp.modalWindow == window {
+                NSApp.abortModal()
+            }
+
+            // orderOut immediately removes from screen; close() releases it.
+            window.orderOut(nil)
+            window.close()
         }
+    }
+
+    /// Returns `true` if the window is a SidecarCore error alert that should be suppressed.
+    /// Called from both the timer sweep and the method-swizzle interceptor.
+    static func isSidecarAlertPanel(_ window: NSWindow) -> Bool {
+        guard window is NSPanel, let contentView = window.contentView else { return false }
+        return sidecarAlertPatterns.contains { viewTreeContainsText(contentView, matching: $0) }
     }
 
     private static func viewTreeContainsText(_ view: NSView, matching text: String) -> Bool {
@@ -566,6 +744,34 @@ enum SidecarError: LocalizedError {
             return "No iPad is currently connected."
         case .apiUnavailable:
             return "Sidecar API not available on this system."
+        }
+    }
+}
+
+// MARK: - NSWindow Alert Interceptor (Method Swizzling)
+
+extension NSWindow {
+    /// Swizzled replacement for `orderFront:`. Suppresses SidecarCore alert panels
+    /// before they are ever rendered, preventing alert accumulation.
+    @objc func ipm_orderFront(_ sender: Any?) {
+        // Call original first (implementations are swapped, so this calls real orderFront:)
+        self.ipm_orderFront(sender)
+        // If this is a SidecarCore alert, immediately yank it off screen and close it.
+        // Both calls happen in the same run-loop turn so the panel is never rendered.
+        if SidecarBridge.isSidecarAlertPanel(self) {
+            if NSApp.modalWindow == self { NSApp.abortModal() }
+            self.orderOut(nil)
+            self.close()
+        }
+    }
+
+    /// Swizzled replacement for `makeKeyAndOrderFront:`.
+    @objc func ipm_makeKeyAndOrderFront(_ sender: Any?) {
+        self.ipm_makeKeyAndOrderFront(sender)
+        if SidecarBridge.isSidecarAlertPanel(self) {
+            if NSApp.modalWindow == self { NSApp.abortModal() }
+            self.orderOut(nil)
+            self.close()
         }
     }
 }
