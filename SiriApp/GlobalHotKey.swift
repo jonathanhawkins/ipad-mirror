@@ -1,10 +1,12 @@
 import Cocoa
 import Carbon.HIToolbox
 
+/// Global hotkey using the Carbon RegisterEventHotKey API.
+/// Much more reliable than NSEvent.addGlobalMonitorForEvents.
 final class GlobalHotKey {
     static let shared = GlobalHotKey()
 
-    private var monitor: Any?
+    private var hotKeyRef: EventHotKeyRef?
     private var callback: (() -> Void)?
 
     // UserDefaults keys
@@ -52,26 +54,40 @@ final class GlobalHotKey {
         self.callback = callback
         unregister()
 
-        let targetKeyCode = self.keyCode
-        let targetModifiers = self.modifierFlags
-        let relevantFlags: NSEvent.ModifierFlags = [.control, .option, .shift, .command]
+        // Convert NSEvent modifier flags to Carbon modifier flags
+        let carbonModifiers = carbonModifierFlags(from: modifierFlags)
 
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            let pressed = event.modifierFlags.intersection(relevantFlags)
-            if event.keyCode == targetKeyCode && pressed == targetModifiers {
-                NSLog("[iPad Mirror] Hotkey triggered")
-                self?.callback?()
-            }
+        // Install the event handler (idempotent — only installs once)
+        installCarbonEventHandler()
+
+        // Register the hotkey with the system
+        var hotKeyID = EventHotKeyID()
+        hotKeyID.signature = OSType(0x49504D48) // "IPMH" — iPad Mirror Hotkey
+        hotKeyID.id = 1
+
+        let status = RegisterEventHotKey(
+            UInt32(keyCode),
+            carbonModifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+
+        if status == noErr {
+            isEnabled = true
+            NSLog("[iPad Mirror] Carbon hotkey registered: \(displayString)")
+            logToFile("Carbon hotkey registered: \(displayString)")
+        } else {
+            NSLog("[iPad Mirror] Failed to register Carbon hotkey: \(status)")
+            logToFile("Failed to register Carbon hotkey: \(status)")
         }
-
-        isEnabled = true
-        NSLog("[iPad Mirror] Global hotkey registered: \(displayString)")
     }
 
     func unregister() {
-        if let monitor = monitor {
-            NSEvent.removeMonitor(monitor)
-            self.monitor = nil
+        if let ref = hotKeyRef {
+            UnregisterEventHotKey(ref)
+            hotKeyRef = nil
         }
     }
 
@@ -81,6 +97,62 @@ final class GlobalHotKey {
         if let cb = callback {
             register(callback: cb)
         }
+    }
+
+    // MARK: - Carbon Event Handler
+
+    private static var handlerInstalled = false
+
+    private func installCarbonEventHandler() {
+        guard !Self.handlerInstalled else { return }
+        Self.handlerInstalled = true
+
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { (_, event, _) -> OSStatus in
+                GlobalHotKey.shared.handleCarbonHotKey(event)
+                return noErr
+            },
+            1,
+            &eventType,
+            nil,
+            nil
+        )
+    }
+
+    private func handleCarbonHotKey(_ event: EventRef?) {
+        guard event != nil else { return }
+        NSLog("[iPad Mirror] Hotkey triggered")
+        logToFile("Hotkey triggered")
+        callback?()
+    }
+
+    private func logToFile(_ message: String) {
+        let path = "/tmp/iPadMirror.log"
+        let line = "\(Date()): \(message)\n"
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(line.data(using: .utf8)!)
+            handle.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func carbonModifierFlags(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        var carbon: UInt32 = 0
+        if flags.contains(.command) { carbon |= UInt32(cmdKey) }
+        if flags.contains(.option)  { carbon |= UInt32(optionKey) }
+        if flags.contains(.control) { carbon |= UInt32(controlKey) }
+        if flags.contains(.shift)   { carbon |= UInt32(shiftKey) }
+        return carbon
     }
 
     private func keyCodeToString(_ code: UInt16) -> String {

@@ -9,8 +9,26 @@ struct iPadMirrorApp: App {
     @State private var brokenScreenMode = UserDefaults.standard.bool(forKey: "brokenScreenModeEnabled")
 
     init() {
+        UserDefaults.standard.register(defaults: [
+            "brokenScreenModeEnabled": true,
+            "globalHotKeyEnabled": true,
+        ])
         iPadMirrorShortcuts.updateAppShortcutParameters()
         donateIntents()
+
+        // Register global hotkey immediately during app init
+        GlobalHotKey.shared.register {
+            SpeechManager.shared.announce("Toggling iPad connection.")
+            Task {
+                do {
+                    let result = try await SidecarBridge.shared.toggle()
+                    NSLog("[iPad Mirror] Hotkey toggle: \(result)")
+                } catch {
+                    SpeechManager.shared.announce("Toggle failed. \(error.localizedDescription)")
+                    NSLog("[iPad Mirror] Hotkey toggle failed: \(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     var body: some Scene {
@@ -134,16 +152,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var onboardingWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Register global hotkey if previously configured
-        if GlobalHotKey.shared.isEnabled {
-            GlobalHotKey.shared.register {
-                Task {
-                    do {
-                        let result = try await SidecarBridge.shared.toggle()
-                        NSLog("[iPad Mirror] Hotkey toggle: \(result)")
-                    } catch {
-                        NSLog("[iPad Mirror] Hotkey toggle failed: \(error.localizedDescription)")
-                    }
+        // Always register the global hotkey
+        GlobalHotKey.shared.register {
+            Task {
+                do {
+                    let result = try await SidecarBridge.shared.toggle()
+                    NSLog("[iPad Mirror] Hotkey toggle: \(result)")
+                } catch {
+                    NSLog("[iPad Mirror] Hotkey toggle failed: \(error.localizedDescription)")
                 }
             }
         }
